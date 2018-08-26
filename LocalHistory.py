@@ -11,6 +11,7 @@ from threading import Thread
 import subprocess
 import sublime
 import sublime_plugin
+import string
 
 PY2 = sys.version_info < (3, 0)
 
@@ -21,6 +22,29 @@ else:
 
 NO_SELECTION = -1
 settings = None
+
+def get_filename(view):
+    file_path = view.file_name()
+    if file_path == None or not os.path.isfile(file_path):
+        file_path = '!:\\' + format_filename(view.name() + ' ' + str(view.id())) + '.txt'
+        return (True, file_path)
+    return (False, file_path)
+
+def format_filename(s):
+    """Take a string and return a valid filename constructed from the string.
+    Uses a whitelist approach: any characters not present in valid_chars are
+    removed. Also spaces are replaced with underscores.
+
+    Note: this method may produce invalid filenames such as ``, `.` or `..`
+    When I use this method I prepend a date string like '2009_01_15_19_46_32_'
+    and append a file extension like '.txt', so I avoid the potential of using
+    an invalid filename.
+
+    """
+    valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
+    filename = ''.join(c for c in s if c in valid_chars)
+    filename = filename.replace(' ','_') # I don't like spaces in filenames.
+    return filename
 
 def status_msg(msg):
     sublime.status_message('Local History: ' + msg)
@@ -154,44 +178,38 @@ class HistorySave(sublime_plugin.EventListener):
         if not PY2 or not settings.get('history_on_load', True):
             return
 
-        t = Thread(target=self.process_history, args=(view.file_name(),))
+        t = Thread(target=self.process_history, args=(get_filename(view),view.substr(sublime.Region(0, view.size())),))
         t.start()
 
     def on_load_async(self, view):
         if settings.get('history_on_load', True):
-            t = Thread(target=self.process_history, args=(view.file_name(),))
+            t = Thread(target=self.process_history, args=(get_filename(view),view.substr(sublime.Region(0, view.size())),))
             t.start()
 
     def on_close(self, view):
         if settings.get('history_on_close', True):
-            t = Thread(target=self.process_history, args=(view.file_name(),))
+            t = Thread(target=self.process_history, args=(get_filename(view),view.substr(sublime.Region(0, view.size())),))
             t.start()
 
     def on_post_save(self, view):
         if not PY2 or settings.get('history_on_close', True):
             return
 
-        t = Thread(target=self.process_history, args=(view.file_name(),))
+        t = Thread(target=self.process_history, args=(get_filename(view),view.substr(sublime.Region(0, view.size())),))
         t.start()
 
     def on_post_save_async(self, view):
         if not settings.get('history_on_close', True):
-            t = Thread(target=self.process_history, args=(view.file_name(),))
+            t = Thread(target=self.process_history, args=(get_filename(view),view.substr(sublime.Region(0, view.size())),))
             t.start()
 
     def on_deactivated(self, view):
         if (view.is_dirty() and settings.get('history_on_focus_lost', False)):
-            t = Thread(target=self.process_history, args=(view.file_name(),))
+            t = Thread(target=self.process_history, args=(get_filename(view),view.substr(sublime.Region(0, view.size())),))
             t.start()
 
-    def process_history(self, file_path):
-        if file_path == None:
-            status_msg('File not saved, path does not exist.')
-            return
-
-        if not os.path.isfile(file_path):
-            status_msg('File not saved, might be part of a package.')
-            return
+    def process_history(self, file_name_pack, file_content):
+        (unsaved, file_path) = file_name_pack
 
         size_limit = settings.get('file_size_limit', 4194304)
         history_retention = settings.get('history_retention', 0)
@@ -199,7 +217,7 @@ class HistorySave(sublime_plugin.EventListener):
 
         if PY2:
             file_path = file_path.encode('utf-8')
-        if os.path.getsize(file_path) > size_limit:
+        if not unsaved and os.path.getsize(file_path) > size_limit:
             status_msg('File not saved, exceeded %s limit.' % readable_file_size(size_limit))
             return
 
@@ -211,7 +229,7 @@ class HistorySave(sublime_plugin.EventListener):
         history_files = get_history_files(file_name, history_dir)
 
         if history_files:
-            if filecmp.cmp(file_path, os.path.join(history_dir, history_files[0])):
+            if not unsaved and filecmp.cmp(file_path, os.path.join(history_dir, history_files[0])):
                 status_msg('File not saved, no changes for "' + file_name + '".')
                 return
             elif skip_recently_saved:
@@ -222,7 +240,12 @@ class HistorySave(sublime_plugin.EventListener):
                     return
 
         file_root, file_extension = os.path.splitext(file_name)
-        shutil.copyfile(file_path, os.path.join(history_dir, '{0}-{1}{2}'.format(file_root, datetime.datetime.now().strftime(settings.get('format_timestamp', '%Y%m%d%H%M%S')), file_extension)))
+        if unsaved:
+            fh = open(os.path.join(history_dir, '{0}-{1}{2}'.format(file_root, datetime.datetime.now().strftime(settings.get('format_timestamp', '%Y%m%d%H%M%S')), file_extension)),"w")
+            fh.write(file_content)
+            fh.close()
+        if not unsaved:
+            shutil.copyfile(file_path, os.path.join(history_dir, '{0}-{1}{2}'.format(file_root, datetime.datetime.now().strftime(settings.get('format_timestamp', '%Y%m%d%H%M%S')), file_extension)))
 
         status_msg('File saved, updated Local History for "' + file_name + '".')
 
@@ -238,7 +261,7 @@ class HistorySave(sublime_plugin.EventListener):
 class HistorySaveNow(sublime_plugin.TextCommand):
 
     def run(self, edit):
-        t = Thread(target=HistorySave().process_history, args=(self.view.file_name(),))
+        t = Thread(target=HistorySave().process_history, args=(get_filename(self.view),self.view.substr(sublime.Region(0, self.view.size())),))
         t.start()
 
 class HistoryBrowse(sublime_plugin.TextCommand):
@@ -258,13 +281,10 @@ class HistoryBrowse(sublime_plugin.TextCommand):
 class HistoryOpen(sublime_plugin.TextCommand):
 
     def run(self, edit, autodiff=False):
+        (unsaved, file_path) = get_filename(self.view)
 
-        if not self.view.file_name():
-            status_msg("not a valid file.")
-            return
-
-        file_name = os.path.basename(self.view.file_name())
-        history_dir = get_history_subdir(self.view.file_name())
+        file_name = os.path.basename(file_path)
+        history_dir = get_history_subdir(file_path)
         pre, ext = os.path.splitext(file_name)
 
         history_files = get_history_files(file_name, history_dir)
